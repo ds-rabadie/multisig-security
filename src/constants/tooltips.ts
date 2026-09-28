@@ -59,12 +59,11 @@ export const SECURITY_CHECK_TOOLTIPS: Record<string, TooltipInfo> = {
     ],
     learnMoreUrl: 'https://docs.safe.global/'
   },
-  'Safe Factory': {
-    description: 'Checks whether the Safe was deployed by an official Safe proxy factory contract. Safes deployed by unknown factories may have been created with modified or malicious code.',
+  'Singleton Integrity': {
+    description: 'Verifies that the Safe proxy delegates to an official, audited Safe singleton (master copy) contract. An unofficial singleton could execute malicious code even if deployed by an official factory, since the factory does not validate the singleton address.',
     thresholds: [
-      { status: '✅ Success', condition: 'Deployed by an official Safe proxy factory' },
-      { status: '⚠️ Warning', condition: 'Factory address unknown or could not be checked' },
-      { status: '❌ Error', condition: 'Deployed by an unrecognized factory (requires investigation)' }
+      { status: '✅ Success', condition: 'Delegates to an official Safe singleton contract' },
+      { status: '❌ Error', condition: 'Delegates to an unrecognized singleton (critical security risk)' }
     ],
     learnMoreUrl: 'https://github.com/safe-global/safe-smart-account/tree/main/contracts/proxies'
   },
@@ -93,10 +92,10 @@ export const SECURITY_CHECK_TOOLTIPS: Record<string, TooltipInfo> = {
     learnMoreUrl: 'https://help.safe.global/en/articles/40838-what-is-a-fallback-handler-and-how-does-it-relate-to-safe'
   },
   'Chain Configuration': {
-    description: 'Checks if the Safe exists on multiple chains. Multi-chain deployments create replay attack risks. Security implications include: (1) Replay attack risk - signatures from one chain could potentially be replayed on another, (2) Ensure transactions include proper chain ID verification, (3) Consider using different Safe addresses for different chains.',
+    description: 'Checks if the Safe exists on multiple chains with the same address (canonical deployment). Multi-chain deployments are normal and expected — EIP-712 domain separators prevent cross-chain signature replay. This check is informational; see Multi-Chain Signer Analysis for the actual security risk (signer reuse across chains).',
     thresholds: [
       { status: '✅ Success', condition: 'Deployed on single chain only' },
-      { status: '⚠️ Warning', condition: 'Deployed on multiple chains (replay attack risk)' }
+      { status: 'ℹ️ Informational', condition: 'Deployed on multiple chains (check signer reuse)' }
     ],
     learnMoreUrl: 'https://docs.safe.global/advanced/eip-155'
   },

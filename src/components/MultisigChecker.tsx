@@ -2,14 +2,17 @@
 
 import React, { useState, useMemo, useCallback, useEffect } from 'react';
 import { createPublicClient, http, isAddress, getAddress } from 'viem';
+import type { PublicClient } from 'viem';
 import { multicall } from 'viem/actions';
 import Safe from '@safe-global/protocol-kit';
-import { GNOSIS_SAFE_ABI, OFFICIAL_SAFE_FALLBACK_HANDLERS, OFFICIAL_SAFE_PROXY_FACTORIES, SAFE_VERSIONS_WITH_KNOWN_FACTORIES, SENTINEL_MODULES_ADDRESS } from '../constants/contracts';
+import { GNOSIS_SAFE_ABI, OFFICIAL_SAFE_FALLBACK_HANDLERS, OFFICIAL_SAFE_PROXY_FACTORIES, OFFICIAL_SAFE_SINGLETONS, SENTINEL_MODULES_ADDRESS, GUARD_STORAGE_SLOT, FALLBACK_HANDLER_STORAGE_SLOT, EIP7702_DELEGATION_PREFIX, SAFE_EXEC_TX_METHOD_ID, KNOWN_RECOVERY_MODULE_KEYWORDS } from '../constants/contracts';
 import { SUPPORTED_CHAINS, DEFAULT_CHAIN, CHAIN_ID_MAP, CHAIN_EXAMPLES, SAFE_TX_SERVICE_URLS, SAFE_GITHUB_RELEASES_URL, type ChainConfig, isBlockscout, buildExplorerApiUrl } from '../constants/chains';
 import { getTooltipInfo } from '../constants/tooltips';
-import { Search, Share2, Info, CheckCircle, AlertTriangle, XCircle, Loader2, ChevronDown, ShieldAlert, Shield, HelpCircle } from 'lucide-react';
-import { cn, truncateHash } from '@/lib/utils';
-import { calculateSecurityScore, PENALTY_CONFIG, DEFAULT_PENALTY } from '@/lib/scoring';
+import { Search, Share2, Info, CheckCircle, AlertTriangle, XCircle, Loader2, ChevronDown, HelpCircle } from 'lucide-react';
+import { cn, truncateHash, ZERO_ADDRESS, ZERO_SLOT, extractAddressFromSlot, isContractRevertError, FETCH_TIMEOUT_MS, getEtherscanApiKey } from '@/lib/utils';
+import { calculateSecurityScore, PENALTY_CONFIG, DEFAULT_PENALTY, INFORMATIONAL_CHECKS } from '@/lib/scoring';
+import { CHECK_TITLES } from '@/lib/checkTitles';
+import { SIGNING_SPEED_ERROR_SECONDS, SIGNING_SPEED_WARNING_SECONDS, INACTIVITY_ERROR_DAYS, INACTIVITY_WARNING_DAYS, CONTRACT_AGE_ERROR_DAYS, CONTRACT_AGE_WARNING_DAYS, NONCE_ERROR_MAX, NONCE_WARNING_MAX, THRESHOLD_LOW_ABSOLUTE, THRESHOLD_MAJORITY_PCT, THRESHOLD_LOW_PCT, SAFE_VERSION_CACHE_TTL_MS } from '@/lib/thresholds';
 import { SpeedTest, fetchAndAnalyzeSafe } from './SpeedTest';
 import type { AnalysisResult } from './SpeedTest';
 
@@ -19,18 +22,6 @@ interface RpcError extends Error {
   originalErrors: { primaryError: unknown; backupError: unknown };
 }
 
-// Helper to detect if an error is a contract revert (not an RPC issue)
-const isContractRevertError = (error: unknown): boolean => {
-  if (!(error instanceof Error)) return false;
-  const msg = error.message.toLowerCase();
-  if (msg.includes('revert') || msg.includes('execution reverted')) return true;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const anyErr = error as any;
-  if (anyErr.shortMessage?.toLowerCase().includes('revert')) return true;
-  if (typeof anyErr.name === 'string' && anyErr.name.includes('ContractFunction')) return true;
-  return false;
-};
-
 // Rate limiter for API calls
 
 interface SecurityCheck {
@@ -39,6 +30,12 @@ interface SecurityCheck {
   message: string | React.ReactNode;
 }
 
+
+const APP_VERSION = process.env.NEXT_PUBLIC_APP_VERSION || 'v2.0.0';
+
+function fetchWithTimeout(url: string, options?: RequestInit, timeoutMs: number = FETCH_TIMEOUT_MS): Promise<Response> {
+  return fetch(url, { ...options, signal: options?.signal ?? AbortSignal.timeout(timeoutMs) });
+}
 
 // Safe Transaction Service API URLs
 // Cache for Safe version info fetched from GitHub (shared across analyses)
@@ -113,7 +110,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
   const [error, setError] = useState('');
   const [results, setResults] = useState<SecurityCheck[]>([]);
   const [selectedChain, setSelectedChain] = useState<ChainConfig>(initialChain);
-  const [openTooltip, setOpenTooltip] = useState<number | null>(null);
+  const [openTooltip, setOpenTooltip] = useState<number | string | null>(null);
   const [showShareToast, setShowShareToast] = useState(false);
   const [isToastFading, setIsToastFading] = useState(false);
   const [chainChanged, setChainChanged] = useState(false);
@@ -122,9 +119,14 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
   // Ref to track API-authoritative statuses so frontend async callbacks don't overwrite them
   const apiStatusRef = React.useRef<Record<string, 'success' | 'warning' | 'error' | 'unavailable'>>({});
 
+  // Analysis generation counter to prevent stale async callbacks from corrupting state
+  const analysisGenRef = React.useRef(0);
+
   // Reconcile frontend statuses with the API-authoritative statuses.
   // The API overrides the frontend unless the frontend already determined data was unavailable
   // (the API may default failed reads to "success" via zero-address fallbacks).
+  // The API also must NOT downgrade a frontend success/warning/error to "unavailable" —
+  // if the frontend got data but the API didn't, the frontend's result should be kept.
   React.useEffect(() => {
     const apiStatuses = apiStatusRef.current;
     if (Object.keys(apiStatuses).length === 0) return;
@@ -133,7 +135,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       let needsUpdate = false;
       const newResults = prevResults.map(r => {
         const apiStatus = apiStatuses[r.title];
-        if (apiStatus && r.status !== 'loading' && r.status !== 'unavailable' && r.status !== apiStatus) {
+        if (apiStatus && r.status !== 'loading' && r.status !== 'unavailable' && apiStatus !== 'unavailable' && r.status !== apiStatus) {
           needsUpdate = true;
           return { ...r, status: apiStatus };
         }
@@ -153,15 +155,14 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
     const rpcUrl = useBackup ? chain.backupRpcUrl : chain.rpcUrl;
     return createPublicClient({
       chain: chain.viemChain,
-      transport: http(rpcUrl)
+      transport: http(rpcUrl, { timeout: FETCH_TIMEOUT_MS })
     });
   }, []);
 
   // Helper function to execute RPC calls with automatic backup fallback
   const executeWithBackup = async <T,>(
     chain: ChainConfig,
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    operation: (client: any) => Promise<T>
+    operation: (client: PublicClient) => Promise<T>
   ): Promise<T> => {
     try {
       const client = createClient(chain);
@@ -217,7 +218,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
     latestReleaseDate: Date | null;
   }> => {
     // Return cached result if still fresh (24 hours)
-    const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+    const CACHE_TTL_MS = SAFE_VERSION_CACHE_TTL_MS;
     if (
       safeVersionCache.data &&
       Date.now() - safeVersionCache.fetchedAt < CACHE_TTL_MS
@@ -226,7 +227,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
     }
 
     try {
-      const response = await fetch(SAFE_GITHUB_RELEASES_URL, {
+      const response = await fetchWithTimeout(SAFE_GITHUB_RELEASES_URL, {
         headers: {
           'Accept': 'application/json',
         },
@@ -364,7 +365,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
           address: address as `0x${string}`,
           abi: GNOSIS_SAFE_ABI,
           functionName: 'getModulesPaginated',
-          args: [SENTINEL_MODULES_ADDRESS, 10],
+          args: [SENTINEL_MODULES_ADDRESS, 10n],
         });
       });
       modules = moduleArray;
@@ -374,14 +375,18 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
     let guard: string | { error: string } | null = null;
     try {
-      const guardAddress = await executeWithBackup(chain, async (client) => {
-        return await client.readContract({
+      const guardSlot = await executeWithBackup(chain, async (client) => {
+        return await client.getStorageAt({
           address: address as `0x${string}`,
-          abi: GNOSIS_SAFE_ABI,
-          functionName: 'getGuard',
+          slot: GUARD_STORAGE_SLOT as `0x${string}`,
         });
       });
-      guard = guardAddress as string;
+      const guardAddress = extractAddressFromSlot(guardSlot) || ZERO_ADDRESS;
+      guard = guardAddress;
+      const [, minor] = (version as string).split('.').map(Number);
+      if (guardAddress === ZERO_ADDRESS && minor < 3) {
+        guard = { error: 'UNSUPPORTED_VERSION' };
+      }
     } catch {
       const [, minor] = (version as string).split('.').map(Number);
       guard = minor < 3 ? { error: 'UNSUPPORTED_VERSION' } : null;
@@ -389,14 +394,13 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
     let fallbackHandler: string | null = null;
     try {
-      const handlerAddress = await executeWithBackup(chain, async (client) => {
-        return await client.readContract({
+      const fallbackSlot = await executeWithBackup(chain, async (client) => {
+        return await client.getStorageAt({
           address: address as `0x${string}`,
-          abi: GNOSIS_SAFE_ABI,
-          functionName: 'getFallbackHandler',
+          slot: FALLBACK_HANDLER_STORAGE_SLOT as `0x${string}`,
         });
       });
-      fallbackHandler = handlerAddress as string;
+      fallbackHandler = extractAddressFromSlot(fallbackSlot);
     } catch {
       fallbackHandler = null;
     }
@@ -419,7 +423,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
   const batchGnosisSafeCalls = async (address: string, chain: ChainConfig) => {
     try {
-      const results = await executeWithBackup(chain, async (client) => {
+      const [results, guardSlotValue, fallbackSlotValue] = await executeWithBackup(chain, async (client) => {
         const calls = [
           {
             address: address as `0x${string}`,
@@ -445,28 +449,29 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             address: address as `0x${string}`,
             abi: GNOSIS_SAFE_ABI,
             functionName: 'getModulesPaginated',
-            args: [SENTINEL_MODULES_ADDRESS, 10],
-          },
-          {
-            address: address as `0x${string}`,
-            abi: GNOSIS_SAFE_ABI,
-            functionName: 'getGuard',
-          },
-          {
-            address: address as `0x${string}`,
-            abi: GNOSIS_SAFE_ABI,
-            functionName: 'getFallbackHandler',
+            args: [SENTINEL_MODULES_ADDRESS, 10n],
           },
         ];
 
-        return await multicall(client, {
+        const multicallResults = await multicall(client, {
           contracts: calls,
           allowFailure: true,
         });
+
+        const guardSlot = await client.getStorageAt({
+          address: address as `0x${string}`,
+          slot: GUARD_STORAGE_SLOT as `0x${string}`,
+        });
+        const fallbackSlot = await client.getStorageAt({
+          address: address as `0x${string}`,
+          slot: FALLBACK_HANDLER_STORAGE_SLOT as `0x${string}`,
+        });
+
+        return [multicallResults, guardSlot, fallbackSlot] as const;
       });
 
       // Process results and handle potential errors
-      const [versionResult, thresholdResult, ownersResult, nonceResult, modulesResult, guardResult, fallbackHandlerResult] = results;
+      const [versionResult, thresholdResult, ownersResult, nonceResult, modulesResult] = results;
 
       if (
         versionResult.status === 'failure' ||
@@ -489,20 +494,17 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
         modules = moduleArray;
       }
 
-      // Handle guard result - getGuard doesn't exist on Safe versions before 1.3.0
-      let guard: string | { error: string } | null = null;
-      if (guardResult.status === 'success') {
-        guard = guardResult.result as string;
-      } else {
-        const [, minor] = version.split('.').map(Number);
-        guard = minor < 3 ? { error: 'UNSUPPORTED_VERSION' } : null;
+      // Read guard from storage slot (Safe v1.4.1 removed public getGuard())
+      const guardAddress = extractAddressFromSlot(guardSlotValue) || ZERO_ADDRESS;
+      let guard: string | { error: string } | null = guardAddress;
+      const [, minor] = version.split('.').map(Number);
+      if (guardAddress === ZERO_ADDRESS && minor < 3) {
+        guard = { error: 'UNSUPPORTED_VERSION' };
       }
 
-      // Handle fallback handler result
+      // Read fallback handler from storage slot (Safe v1.4.1 has no getFallbackHandler())
       let fallbackHandler: string | null = null;
-      if (fallbackHandlerResult.status === 'success') {
-        fallbackHandler = fallbackHandlerResult.result as string;
-      }
+      fallbackHandler = extractAddressFromSlot(fallbackSlotValue);
 
       // Validate version format
       if (!checkVersionFormat(version)) {
@@ -547,24 +549,39 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
   };
 
   const getContractCreationDate = async (addr: string, chain: ChainConfig): Promise<Date | null> => {
-    try {
-      // Use explorer API to get contract creation information
-      const ETHERSCAN_API_KEY = process.env.NEXT_PUBLIC_ETHERSCAN_API_KEY || 'YourApiKeyToken';
+    // 1. Try Safe Transaction Service first (free, no API key needed on most chains)
+    if (chain.safeTransactionServiceUrl) {
+      try {
+        const checksummedAddr = getAddress(addr);
+        const url = `${chain.safeTransactionServiceUrl}/api/v1/safes/${checksummedAddr}/creation/`;
+        const response = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } });
+        if (response.ok) {
+          const data = await response.json();
+          if (data.created) {
+            return new Date(data.created);
+          }
+        }
+      } catch (err) {
+        console.error('Safe Transaction Service creation date fetch failed:', err);
+        // Fall through to Etherscan fallback
+      }
+    }
 
-      if (!isBlockscout(chain.explorerApiUrl) && (!ETHERSCAN_API_KEY || ETHERSCAN_API_KEY === 'YourApiKeyToken')) {
+    // 2. Fallback: Etherscan/Blockscout explorer API (requires API key for Etherscan)
+    try {
+      const ETHERSCAN_API_KEY = getEtherscanApiKey();
+      if (!isBlockscout(chain.explorerApiUrl) && !ETHERSCAN_API_KEY) {
         return null;
       }
 
-
-      // Get first 20 transactions in one call to find contract creation efficiently
-      const apikeyParam = isBlockscout(chain.explorerApiUrl) ? '' : `&apikey=${ETHERSCAN_API_KEY}`;
+      const apikeyParam = (!isBlockscout(chain.explorerApiUrl) && ETHERSCAN_API_KEY) ? `&apikey=${ETHERSCAN_API_KEY}` : '';
       const apiUrl = buildExplorerApiUrl(chain.explorerApiUrl, chain.id, {
         module: 'account', action: 'txlist', address: addr,
         startblock: '0', endblock: '99999999', page: '1', offset: '20', sort: 'asc',
       }) + apikeyParam;
 
       const response = await etherscanRateLimiter.makeRequest(() =>
-        fetch(apiUrl, {
+        fetchWithTimeout(apiUrl, {
           headers: {
             'Accept': 'application/json',
           },
@@ -600,17 +617,33 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
   };
 
   const getLastTransactionDate = async (addr: string, chain: ChainConfig): Promise<Date | null> => {
-    try {
-      // Use explorer API to get the most recent transaction
-      const ETHERSCAN_API_KEY = process.env.NEXT_PUBLIC_ETHERSCAN_API_KEY || 'YourApiKeyToken';
+    // 1. Try Safe Transaction Service first (free, no API key needed on most chains)
+    if (chain.safeTransactionServiceUrl) {
+      try {
+        const checksummedAddr = getAddress(addr);
+        const url = `${chain.safeTransactionServiceUrl}/api/v1/safes/${checksummedAddr}/multisig-transactions/?executed=true&limit=1&ordering=-nonce`;
+        const response = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } });
+        if (response.ok) {
+          const data = await response.json();
+          if (data.results && data.results.length > 0 && data.results[0].executionDate) {
+            return new Date(data.results[0].executionDate);
+          }
+          // No transactions found in Safe — fall through to Etherscan to catch on-chain txs
+        }
+      } catch (err) {
+        console.error('Safe Transaction Service last tx date fetch failed:', err);
+        // Fall through to Etherscan fallback
+      }
+    }
 
-      if (!isBlockscout(chain.explorerApiUrl) && (!ETHERSCAN_API_KEY || ETHERSCAN_API_KEY === 'YourApiKeyToken')) {
+    // 2. Fallback: Etherscan/Blockscout explorer API (requires API key for Etherscan)
+    try {
+      const ETHERSCAN_API_KEY = getEtherscanApiKey();
+      if (!isBlockscout(chain.explorerApiUrl) && !ETHERSCAN_API_KEY) {
         return null;
       }
 
-
-      // Get the most recent transaction by sorting in descending order and taking the first result
-      const apikeyParam = isBlockscout(chain.explorerApiUrl) ? '' : `&apikey=${ETHERSCAN_API_KEY}`;
+      const apikeyParam = (!isBlockscout(chain.explorerApiUrl) && ETHERSCAN_API_KEY) ? `&apikey=${ETHERSCAN_API_KEY}` : '';
       const apiUrl = buildExplorerApiUrl(chain.explorerApiUrl, chain.id, {
         module: 'account', action: 'txlist', address: addr,
         startblock: '0', endblock: '99999999', page: '1', offset: '1', sort: 'desc',
@@ -618,7 +651,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       try {
         const response = await etherscanRateLimiter.makeRequest(() =>
-          fetch(apiUrl, {
+          fetchWithTimeout(apiUrl, {
             headers: {
               'Accept': 'application/json',
             },
@@ -653,9 +686,9 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
     inactiveOwners: string[];
     errorOwners: string[];
   }> => {
-    const ETHERSCAN_API_KEY = process.env.NEXT_PUBLIC_ETHERSCAN_API_KEY || 'YourApiKeyToken';
+    const ETHERSCAN_API_KEY = getEtherscanApiKey();
 
-    if (!isBlockscout(chain.explorerApiUrl) && (!ETHERSCAN_API_KEY || ETHERSCAN_API_KEY === 'YourApiKeyToken')) {
+    if (!isBlockscout(chain.explorerApiUrl) && !ETHERSCAN_API_KEY) {
       // Explorer API key not configured for owner transaction lookup
       return {
         activeOwners: [],
@@ -669,28 +702,27 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       ownerAddresses.map(async (ownerAddr) => {
         try {
           // Get recent transactions to check for non-multisig activity
-          const apikeyParam = isBlockscout(chain.explorerApiUrl) ? '' : `&apikey=${ETHERSCAN_API_KEY}`;
+          const apikeyParam = (!isBlockscout(chain.explorerApiUrl) && ETHERSCAN_API_KEY) ? `&apikey=${ETHERSCAN_API_KEY}` : '';
           const apiUrl = buildExplorerApiUrl(chain.explorerApiUrl, chain.id, {
             module: 'account', action: 'txlist', address: ownerAddr,
             startblock: '0', endblock: '99999999', page: '1', offset: '10', sort: 'desc',
           }) + apikeyParam;
 
-          // Add timeout to prevent hanging requests
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
-
           let response;
           try {
             response = await etherscanRateLimiter.makeRequest(() =>
-              fetch(apiUrl, {
+              fetchWithTimeout(apiUrl, {
                 headers: {
                   'Accept': 'application/json',
                 },
-                signal: controller.signal,
               })
             );
-          } finally {
-            clearTimeout(timeoutId);
+          } catch (err) {
+            if (err instanceof Error && err.name === 'TimeoutError') {
+              console.error(`Timeout checking owner ${ownerAddr}:`, err);
+              return { address: ownerAddr, status: 'inactive', lastTxDate: null };
+            }
+            throw err;
           }
 
           if (!response.ok) {
@@ -701,10 +733,10 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
           const data = await response.json();
 
           if (data.status === '1' && data.result && data.result.length > 0) {
-            // Filter out transactions with methodID 0x6a761202 (acceptable transactions)
+            // Filter out Safe execTransaction calls (acceptable transactions)
             const nonMultisigTxs = data.result.filter((tx: { input?: string; timeStamp: string }) => {
               const methodId = tx.input ? tx.input.slice(0, 10) : '';
-              return methodId !== '0x6a761202';
+              return methodId !== SAFE_EXEC_TX_METHOD_ID;
             });
 
             if (nonMultisigTxs.length === 0) {
@@ -727,10 +759,6 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             return { address: ownerAddr, status: 'inactive', lastTxDate: null };
           }
         } catch (error) {
-          if (error instanceof Error && error.name === 'AbortError') {
-            console.error(`Timeout checking owner ${ownerAddr}:`, error);
-            return { address: ownerAddr, status: 'error', lastTxDate: null };
-          }
           console.error(`Error checking owner ${ownerAddr}:`, error);
           return { address: ownerAddr, status: 'error', lastTxDate: null };
         }
@@ -761,9 +789,9 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
   const getContractName = async (address: string, chain: ChainConfig, retryCount = 0): Promise<string> => {
     try {
-      const ETHERSCAN_API_KEY = process.env.NEXT_PUBLIC_ETHERSCAN_API_KEY || 'YourApiKeyToken';
+      const ETHERSCAN_API_KEY = getEtherscanApiKey();
 
-      if (!isBlockscout(chain.explorerApiUrl) && (!ETHERSCAN_API_KEY || ETHERSCAN_API_KEY === 'YourApiKeyToken')) {
+      if (!isBlockscout(chain.explorerApiUrl) && !ETHERSCAN_API_KEY) {
         // No API key configured, returning address
         return address;
       }
@@ -776,28 +804,30 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       }
 
       // Try to make the request directly to explorer API
-      const apikeyParam = isBlockscout(chain.explorerApiUrl) ? '' : `&apikey=${ETHERSCAN_API_KEY}`;
+      const apikeyParam = (!isBlockscout(chain.explorerApiUrl) && ETHERSCAN_API_KEY) ? `&apikey=${ETHERSCAN_API_KEY}` : '';
       const apiUrl = buildExplorerApiUrl(chain.explorerApiUrl, chain.id, {
         module: 'contract', action: 'getsourcecode', address: address,
       }) + apikeyParam;
 
-      // Add timeout to prevent hanging requests
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 20000); // 20 second timeout
-
       let response;
       try {
         response = await etherscanRateLimiter.makeRequest(() =>
-          fetch(apiUrl, {
+          fetchWithTimeout(apiUrl, {
             method: 'GET',
             headers: {
               'Accept': 'application/json',
             },
-            signal: controller.signal,
           })
         );
-      } finally {
-        clearTimeout(timeoutId);
+      } catch (err) {
+        if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+          console.error(`Timeout fetching contract name for ${address}`);
+          if (retryCount < 3) {
+            return await getContractName(address, chain, retryCount + 1);
+          }
+          return address;
+        }
+        throw err;
       }
 
       if (!response.ok) {
@@ -836,20 +866,11 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       // For contracts without verified source code, this is expected behavior
       return address;
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        console.error(`Timeout fetching contract name for ${address}`);
-        // Retry on timeout if we haven't exceeded retry limit
-        if (retryCount < 3) {
-          // Retrying after timeout
-          return await getContractName(address, chain, retryCount + 1);
-        }
-      } else {
-        console.error(`Error fetching contract name for ${address}:`, error);
-        // Retry on network errors too
-        if (retryCount < 2) {
-          // Retrying after error
-          return await getContractName(address, chain, retryCount + 1);
-        }
+      console.error(`Error fetching contract name for ${address}:`, error);
+      // Retry on network errors (timeout is already handled above)
+      if (retryCount < 2) {
+        // Retrying after error
+        return await getContractName(address, chain, retryCount + 1);
       }
 
       // Failed to get contract name after retries
@@ -857,8 +878,15 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
     }
   };
 
-  const checkContractSigners = async (owners: readonly string[], chain: ChainConfig): Promise<string[]> => {
+  const checkContractSigners = async (owners: readonly string[], chain: ChainConfig): Promise<{
+    contractSigners: string[];
+    eip7702Signers: string[];
+  }> => {
     const contractSigners: string[] = [];
+    const eip7702Signers: string[] = [];
+
+    // EIP-7702 delegation designator prefix — EOAs with active delegations return
+    // bytecode starting with 0xef01 but are still EOAs, not smart contracts.
 
     try {
       const client = createClient(chain);
@@ -867,31 +895,33 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
         owners.map(async (ownerAddress) => {
           try {
             const code = await client.getBytecode({ address: ownerAddress as `0x${string}` });
-            return {
-              address: ownerAddress,
-              hasCode: code !== undefined && code !== '0x' && code.length > 2
-            };
+            if (code && code !== '0x' && code.length > 2) {
+              if (code.startsWith(EIP7702_DELEGATION_PREFIX)) {
+                return { address: ownerAddress, isContract: false, isEip7702: true };
+              }
+              return { address: ownerAddress, isContract: true, isEip7702: false };
+            }
+            return { address: ownerAddress, isContract: false, isEip7702: false };
           } catch (error) {
             console.error(`Error checking code for owner ${ownerAddress}:`, error);
-            return {
-              address: ownerAddress,
-              hasCode: false
-            };
+            return { address: ownerAddress, isContract: false, isEip7702: false };
           }
         })
       );
 
-      // Collect addresses that have contract code
-      codeChecks.forEach(({ address, hasCode }) => {
-        if (hasCode) {
+      codeChecks.forEach(({ address, isContract, isEip7702 }) => {
+        if (isContract) {
           contractSigners.push(address);
+        }
+        if (isEip7702) {
+          eip7702Signers.push(address);
         }
       });
 
-      return contractSigners;
+      return { contractSigners, eip7702Signers };
     } catch (error) {
       console.error('Error checking contract signers:', error);
-      return [];
+      return { contractSigners: [], eip7702Signers: [] };
     }
   };
 
@@ -904,7 +934,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       const chainResults = await Promise.allSettled(
         deployedChains.map(async (chain) => {
           const maxRetries = 3;
-          let owners: string[] | null = null;
+          const owners: string[] | null = null;
 
           for (let retryCount = 0; retryCount < maxRetries && owners === null; retryCount++) {
             try {
@@ -1002,13 +1032,6 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
     let recoveryThreshold: number | null = null;
 
     // Common recovery module patterns and addresses
-    const KNOWN_RECOVERY_MODULES = [
-      'social recovery',
-      'recovery',
-      'guardian',
-      'allowance',
-      'delay'
-    ];
 
     try {
       // Check if any modules are recovery-related
@@ -1019,7 +1042,7 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
           const lowerName = moduleName.toLowerCase();
 
           // Check if module name contains recovery-related keywords
-          const isRecoveryModule = KNOWN_RECOVERY_MODULES.some(keyword =>
+          const isRecoveryModule = KNOWN_RECOVERY_MODULE_KEYWORDS.some(keyword =>
             lowerName.includes(keyword)
           );
 
@@ -1125,52 +1148,70 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
   };
 
   // Helper function to check if the Safe was deployed by an official factory
-  const checkSafeFactory = async (address: string, chainId: number, safeVersion: string): Promise<{
-    factoryAddress: string | null;
-    factoryName: string | null;
+  const checkSingletonIntegrity = async (address: string, chainId: number): Promise<{
+    masterCopy: string | null;
+    singletonName: string | null;
     isOfficial: boolean | null;
-    versionHasKnownFactories: boolean;
+    factoryAddress?: string | null;
+    factoryNote?: string;
     error?: string;
   }> => {
-    const versionHasKnownFactories = SAFE_VERSIONS_WITH_KNOWN_FACTORIES.has(safeVersion);
-
     const baseUrl = SAFE_TX_SERVICE_URLS[chainId];
     if (!baseUrl) {
-      return { factoryAddress: null, factoryName: null, isOfficial: null, versionHasKnownFactories, error: 'Unsupported chain' };
+      return { masterCopy: null, singletonName: null, isOfficial: null, error: 'Unsupported chain' };
     }
 
     try {
       const checksummedAddress = getAddress(address);
       const url = `${baseUrl}/api/v1/safes/${checksummedAddress}/creation/`;
-      const response = await fetch(url, { headers: { Accept: 'application/json' } });
+      const response = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } });
 
       if (!response.ok) {
-        return { factoryAddress: null, factoryName: null, isOfficial: null, versionHasKnownFactories, error: `API error: ${response.status}` };
+        return { masterCopy: null, singletonName: null, isOfficial: null, error: `API error: ${response.status}` };
       }
 
       const data = await response.json();
-      const factoryAddress = data.factoryAddress;
+      const masterCopy = data.masterCopy;
+      const factoryAddress = data.factoryAddress || null;
 
-      if (!factoryAddress) {
-        return { factoryAddress: null, factoryName: null, isOfficial: null, versionHasKnownFactories, error: 'No factory address returned' };
+      if (!masterCopy) {
+        return { masterCopy: null, singletonName: null, isOfficial: null, factoryAddress, error: 'No masterCopy address returned' };
       }
 
-      const factoryInfo = OFFICIAL_SAFE_PROXY_FACTORIES[factoryAddress.toLowerCase()] || null;
-      return {
-        factoryAddress,
-        factoryName: factoryInfo?.name || null,
-        isOfficial: factoryInfo !== null,
-        versionHasKnownFactories,
-      };
+      const chainSingletons = OFFICIAL_SAFE_SINGLETONS[chainId];
+      if (!chainSingletons) {
+        return { masterCopy, singletonName: null, isOfficial: null, factoryAddress, error: 'No singleton registry for this chain' };
+      }
+
+      const singletonName = chainSingletons[masterCopy.toLowerCase()] || null;
+      if (singletonName) {
+        return { masterCopy, singletonName, isOfficial: true, factoryAddress };
+      }
+
+      const factoryInfo = factoryAddress ? OFFICIAL_SAFE_PROXY_FACTORIES?.[factoryAddress.toLowerCase()] : null;
+      const factoryNote = factoryInfo
+        ? ` (deployed by official factory: ${factoryInfo.name}, but singleton is unrecognized)`
+        : '';
+
+      return { masterCopy, singletonName: null, isOfficial: false, factoryAddress, factoryNote };
     } catch (error) {
-      return { factoryAddress: null, factoryName: null, isOfficial: null, versionHasKnownFactories, error: error instanceof Error ? error.message : 'Unknown error' };
+      return { masterCopy: null, singletonName: null, isOfficial: null, error: error instanceof Error ? error.message : 'Unknown error' };
     }
   };
 
   const performAnalysis = useCallback(async (addressToAnalyze: string) => {
+    const currentGen = ++analysisGenRef.current;
+    apiStatusRef.current = {};
     setLoading(true);
     setError('');
     setResults([]);
+
+    // Helper: only call setResults if this is still the current analysis generation
+    const safeSetResults = (updater: React.SetStateAction<SecurityCheck[]>) => {
+      if (analysisGenRef.current === currentGen) {
+        setResults(updater);
+      }
+    };
 
     try {
       const hasCode = await checkContractCode(addressToAnalyze, selectedChain);
@@ -1203,25 +1244,25 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Initialize all sections with loading status
       const initialResults: SecurityCheck[] = [
-        { title: 'Signing Speed Analysis', status: 'loading', message: 'Analyzing transaction signing patterns...' },
-        { title: 'Signer Threshold', status: 'loading', message: 'Loading threshold information...' },
-        { title: 'Signer Threshold Percentage', status: 'loading', message: 'Loading threshold percentage...' },
-        { title: 'Safe Version', status: 'loading', message: 'Loading version information...' },
-        { title: 'Contract Creation Date', status: 'loading', message: 'Loading creation date...' },
-        { title: 'Multisig Nonce', status: 'loading', message: 'Loading nonce information...' },
-        { title: 'Last Transaction Date', status: 'loading', message: 'Loading last transaction date...' },
-        { title: 'Safe Factory', status: 'loading', message: 'Checking deployment factory...' },
-        { title: 'Optional Modules', status: 'loading', message: 'Loading module information...' },
-        { title: 'Transaction Guard', status: 'loading', message: 'Checking transaction guard configuration...' },
-        { title: 'Fallback Handler', status: 'loading', message: 'Checking fallback handler configuration...' },
-        { title: 'Chain Configuration', status: 'loading', message: 'Checking multi-chain deployment and replay protection...' },
-        { title: 'Owner Activity Analysis', status: 'loading', message: 'Analyzing owner transaction activity...' },
-        { title: 'Emergency Recovery Mechanisms', status: 'loading', message: 'Checking recovery module configuration...' },
-        { title: 'Contract Signers', status: 'loading', message: 'Checking if signers are contracts...' },
-        { title: 'Multi-Chain Signer Analysis', status: 'loading', message: 'Multi-chain deployment not detected' }
+        { title: CHECK_TITLES.SIGNING_SPEED, status: 'loading', message: 'Analyzing transaction signing patterns...' },
+        { title: CHECK_TITLES.SIGNER_THRESHOLD, status: 'loading', message: 'Loading threshold information...' },
+        { title: CHECK_TITLES.SIGNER_THRESHOLD_PCT, status: 'loading', message: 'Loading threshold percentage...' },
+        { title: CHECK_TITLES.SAFE_VERSION, status: 'loading', message: 'Loading version information...' },
+        { title: CHECK_TITLES.CONTRACT_CREATION_DATE, status: 'loading', message: 'Loading creation date...' },
+        { title: CHECK_TITLES.MULTISIG_NONCE, status: 'loading', message: 'Loading nonce information...' },
+        { title: CHECK_TITLES.LAST_TRANSACTION_DATE, status: 'loading', message: 'Loading last transaction date...' },
+        { title: CHECK_TITLES.SINGLETON_INTEGRITY, status: 'loading', message: 'Checking singleton integrity...' },
+        { title: CHECK_TITLES.OPTIONAL_MODULES, status: 'loading', message: 'Loading module information...' },
+        { title: CHECK_TITLES.OWNER_ACTIVITY, status: 'loading', message: 'Analyzing owner transaction activity...' },
+        { title: CHECK_TITLES.CONTRACT_SIGNERS, status: 'loading', message: 'Checking if signers are contracts...' },
+        { title: CHECK_TITLES.MULTI_CHAIN_SIGNER, status: 'loading', message: 'Multi-chain deployment not detected' },
+        { title: CHECK_TITLES.TRANSACTION_GUARD, status: 'loading', message: 'Checking transaction guard configuration...' },
+        { title: CHECK_TITLES.FALLBACK_HANDLER, status: 'loading', message: 'Checking fallback handler configuration...' },
+        { title: CHECK_TITLES.CHAIN_CONFIGURATION, status: 'loading', message: 'Checking multi-chain deployment...' },
+        { title: CHECK_TITLES.EMERGENCY_RECOVERY, status: 'loading', message: 'Checking recovery module configuration...' },
       ];
 
-      setResults(initialResults);
+      safeSetResults(initialResults);
       
       // Show results immediately while individual checks load in background
       setLoading(false);
@@ -1239,13 +1280,16 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             apiChecksByTitle[check.title] = { status: check.status, message: check.message };
           }
 
+          // Skip if a newer analysis has started since this fetch began
+          if (analysisGenRef.current !== currentGen) return;
+
           // Store API statuses in ref so frontend async callbacks can reference them
           apiStatusRef.current = {};
           for (const [title, apiCheck] of Object.entries(apiChecksByTitle)) {
             apiStatusRef.current[title] = apiCheck.status as 'success' | 'warning' | 'error' | 'unavailable';
           }
 
-          setResults(currentResults => {
+          safeSetResults(currentResults => {
             const newResults = [...currentResults];
             const titleToIndex: Record<string, number> = {
               'Signing Speed Analysis': 0,
@@ -1255,15 +1299,15 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
               'Contract Creation Date': 4,
               'Multisig Nonce': 5,
               'Last Transaction Date': 6,
-              'Safe Factory': 7,
+              'Singleton Integrity': 7,
               'Optional Modules': 8,
-              'Transaction Guard': 9,
-              'Fallback Handler': 10,
-              'Chain Configuration': 11,
-              'Owner Activity Analysis': 12,
-              'Emergency Recovery Mechanisms': 13,
-              'Contract Signers': 14,
-              'Multi-Chain Signer Analysis': 15,
+              'Owner Activity Analysis': 9,
+              'Contract Signers': 10,
+              'Multi-Chain Signer Analysis': 11,
+              'Transaction Guard': 12,
+              'Fallback Handler': 13,
+              'Chain Configuration': 14,
+              'Emergency Recovery Mechanisms': 15,
             };
 
             for (const [title, index] of Object.entries(titleToIndex)) {
@@ -1280,7 +1324,16 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
                     status: apiCheck.status as 'success' | 'warning' | 'error' | 'unavailable',
                     message: apiCheck.message,
                   };
-                } else if (currentResult.status !== 'unavailable') {
+                } else if (currentResult.status === 'unavailable' && apiCheck.status !== 'unavailable') {
+                  // Frontend fetch failed but API succeeded — let the API result rescue it
+                  newResults[index] = {
+                    ...currentResult,
+                    status: apiCheck.status as 'success' | 'warning' | 'error' | 'unavailable',
+                    message: apiCheck.message,
+                  };
+                } else if (currentResult.status !== 'unavailable' && apiCheck.status !== 'unavailable') {
+                  // Only override status from API if the API actually got data;
+                  // never downgrade a frontend success/warning/error to API "unavailable"
                   newResults[index] = {
                     ...currentResult,
                     status: apiCheck.status as 'success' | 'warning' | 'error' | 'unavailable',
@@ -1301,11 +1354,11 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Safe Version when version info is fetched
       versionInfoPromise.then(({ latestVersion, secondLatestVersion, latestReleaseDate }) => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
           const versionStatus = compareVersions(version, latestVersion, secondLatestVersion, latestReleaseDate);
           newResults[3] = {
-            title: 'Safe Version',
+            title: CHECK_TITLES.SAFE_VERSION,
             status: versionStatus === 'latest' || versionStatus === 'second-latest' ? 'success' : versionStatus === 'old' ? 'warning' : 'error',
             message: versionStatus === 'latest'
               ? `Latest version: ${version}${latestVersion ? ` (current latest: ${latestVersion})` : ''}`
@@ -1329,32 +1382,34 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       const ownerCount = owners.length;
       const thresholdPct = ownerCount > 0 ? (thresholdNum / ownerCount) * 100 : 0;
       const thresholdStatus: 'error' | 'warning' | 'success' =
-        thresholdNum === 1 ? 'error'
-        : thresholdNum <= 3 && thresholdPct < 51 ? 'warning'
+        thresholdNum === 0 || thresholdNum === 1 ? 'error'
+        : thresholdNum <= THRESHOLD_LOW_ABSOLUTE && thresholdPct < THRESHOLD_MAJORITY_PCT ? 'warning'
         : 'success';
       updatedResults[1] = {
-        title: 'Signer Threshold',
+        title: CHECK_TITLES.SIGNER_THRESHOLD,
         status: thresholdStatus,
-        message: thresholdNum === 1
-          ? `Single signature requirement is insecure. Only ${thresholdNum} signature is required to execute transactions.`
-          : thresholdStatus === 'warning'
-            ? `Low signature threshold detected. ${thresholdNum} of ${ownerCount} signatures required to execute transactions.`
-            : `Good signature threshold. ${thresholdNum} of ${ownerCount} signatures required to execute transactions.`
+        message: thresholdNum === 0
+          ? `No signatures required — anyone can execute transactions. Threshold is set to 0.`
+          : thresholdNum === 1
+            ? `Single signature requirement is insecure. Only ${thresholdNum} signature is required to execute transactions.`
+            : thresholdStatus === 'warning'
+              ? `Low signature threshold detected. ${thresholdNum} of ${ownerCount} signatures required to execute transactions.`
+              : `Good signature threshold. ${thresholdNum} of ${ownerCount} signatures required to execute transactions.`
       };
-      setResults([...updatedResults]);
+      safeSetResults([...updatedResults]);
 
       // Update Signer threshold percentage (using already validated owners)
       const thresholdPercentage = (thresholdNum / ownerCount) * 100;
       updatedResults[2] = {
-        title: 'Signer Threshold Percentage',
-        status: thresholdPercentage < 34 ? 'error' : thresholdPercentage < 51 ? 'warning' : 'success',
-        message: thresholdPercentage < 34
+        title: CHECK_TITLES.SIGNER_THRESHOLD_PCT,
+        status: thresholdPercentage < THRESHOLD_LOW_PCT ? 'error' : thresholdPercentage < THRESHOLD_MAJORITY_PCT ? 'warning' : 'success',
+        message: thresholdPercentage < THRESHOLD_LOW_PCT
           ? `Low threshold percentage: only ${thresholdPercentage.toFixed(1)}% of owners (${thresholdNum}/${ownerCount}) required. Consider increasing signer threshold or reducing owners.`
-          : thresholdPercentage < 51
+          : thresholdPercentage < THRESHOLD_MAJORITY_PCT
             ? `Moderate threshold: ${thresholdPercentage.toFixed(1)}% of owners (${thresholdNum}/${ownerCount}) required for transactions.`
             : `Strong threshold: ${thresholdPercentage.toFixed(1)}% of owners (${thresholdNum}/${ownerCount}) required for transactions.`
       };
-      setResults([...updatedResults]);
+      safeSetResults([...updatedResults]);
 
       // Start API calls in parallel for better performance
       const creationDatePromise = getContractCreationDate(addressToAnalyze, selectedChain);
@@ -1365,27 +1420,27 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       const fallbackHandlerPromise = Promise.resolve(fallbackHandlerFromBatch);
       const chainConfigPromise = checkChainConfiguration(addressToAnalyze);
       const recoveryPromise = checkRecoveryMechanisms(addressToAnalyze, selectedChain, modules, threshold);
-      const factoryPromise = checkSafeFactory(addressToAnalyze, selectedChain.id, version);
+      const singletonPromise = checkSingletonIntegrity(addressToAnalyze, selectedChain.id);
 
       // Update Contract Creation Date when ready
       creationDatePromise.then(creationDate => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
           if (creationDate) {
             const daysSinceCreation = (Date.now() - creationDate.getTime()) / (1000 * 60 * 60 * 24);
             const formattedDate = creationDate.toLocaleDateString();
             newResults[4] = {
-              title: 'Contract Creation Date',
-              status: daysSinceCreation <= 7 ? 'error' : daysSinceCreation <= 60 ? 'warning' : 'success',
-              message: daysSinceCreation <= 7
+              title: CHECK_TITLES.CONTRACT_CREATION_DATE,
+              status: daysSinceCreation <= CONTRACT_AGE_ERROR_DAYS ? 'error' : daysSinceCreation <= CONTRACT_AGE_WARNING_DAYS ? 'warning' : 'success',
+              message: daysSinceCreation <= CONTRACT_AGE_ERROR_DAYS
                 ? `Very recently deployed (${Math.floor(daysSinceCreation)} days ago on ${formattedDate}). New contracts carry higher risk.`
-                : daysSinceCreation <= 60
+                : daysSinceCreation <= CONTRACT_AGE_WARNING_DAYS
                   ? `Recently deployed (${Math.floor(daysSinceCreation)} days ago on ${formattedDate}). Relatively new contract.`
                   : `Established contract deployed ${Math.floor(daysSinceCreation)} days ago on ${formattedDate}.`
             };
           } else {
             newResults[4] = {
-              title: 'Contract Creation Date',
+              title: CHECK_TITLES.CONTRACT_CREATION_DATE,
               status: 'unavailable',
               message: 'Could not determine contract creation date'
             };
@@ -1397,43 +1452,43 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       // Update Multisig nonce (using multicall result)
       const nonceNum = Number(nonce);
       updatedResults[5] = {
-        title: 'Multisig Nonce',
-        status: nonceNum <= 3 ? 'error' : nonceNum <= 10 ? 'warning' : 'success',
-        message: nonceNum <= 3
+        title: CHECK_TITLES.MULTISIG_NONCE,
+        status: nonceNum <= NONCE_ERROR_MAX ? 'error' : nonceNum <= NONCE_WARNING_MAX ? 'warning' : 'success',
+        message: nonceNum <= NONCE_ERROR_MAX
           ? `Very low usage: only ${nonceNum} transaction${nonceNum === 1 ? '' : 's'} executed.`
-          : nonceNum <= 10
+          : nonceNum <= NONCE_WARNING_MAX
             ? `Low usage: ${nonceNum} transactions executed.`
             : `Active usage: ${nonceNum} transactions executed.`
       };
-      setResults([...updatedResults]);
+      safeSetResults([...updatedResults]);
 
-      // Update Safe Factory when ready
-      factoryPromise.then(({ factoryAddress, factoryName, isOfficial, versionHasKnownFactories, error }) => {
-        setResults(currentResults => {
+      // Update Singleton Integrity when ready
+      singletonPromise.then(({ masterCopy, singletonName, isOfficial, factoryAddress, factoryNote, error }) => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
           if (error || isOfficial === null) {
             newResults[7] = {
-              title: 'Safe Factory',
+              title: CHECK_TITLES.SINGLETON_INTEGRITY,
               status: 'unavailable',
-              message: 'Could not determine deployment factory.'
+              message: 'Could not determine singleton integrity.'
             };
           } else if (isOfficial) {
             newResults[7] = {
-              title: 'Safe Factory',
+              title: CHECK_TITLES.SINGLETON_INTEGRITY,
               status: 'success',
               message: (
                 <div className="min-w-0">
-                  <div>Deployed by official factory: <strong>{factoryName}</strong></div>
+                  <div>Delegates to official singleton: <strong>{singletonName}</strong></div>
                   <div className="mt-1 sm:mt-2">
                     <div className="ml-1 sm:ml-2 break-all break-words min-w-0 max-w-full overflow-hidden text-sm sm:text-base">
                       <a
-                        href={`${selectedChain.explorerUrl}/address/${factoryAddress}`}
+                        href={`${selectedChain.explorerUrl}/address/${masterCopy}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-blue-600 hover:text-blue-800 underline block"
                       >
-                        {factoryAddress}
+                        {masterCopy}
                       </a>
                     </div>
                   </div>
@@ -1442,24 +1497,21 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             };
           } else {
             newResults[7] = {
-              title: 'Safe Factory',
-              status: versionHasKnownFactories ? 'error' : 'warning',
+              title: CHECK_TITLES.SINGLETON_INTEGRITY,
+              status: 'error',
               message: (
                 <div className="min-w-0">
-                  <div>{versionHasKnownFactories
-                    ? 'Deployed by unrecognized factory. Verify this Safe was not created with modified code.'
-                    : 'Deployed by unrecognized factory. No known official factories for this Safe version, so this may be expected.'
-                  }</div>
+                  <div>Unrecognized singleton address.{factoryNote || ''} Verify this Safe was not created with modified code.</div>
                   <div className="mt-1 sm:mt-2">
-                    <div className="font-medium text-sm sm:text-base">Factory Address:</div>
+                    <div className="font-medium text-sm sm:text-base">Singleton Address:</div>
                     <div className="ml-1 sm:ml-2 break-all break-words min-w-0 max-w-full overflow-hidden text-sm sm:text-base">
                       <a
-                        href={`${selectedChain.explorerUrl}/address/${factoryAddress}`}
+                        href={`${selectedChain.explorerUrl}/address/${masterCopy}`}
                         target="_blank"
                         rel="noopener noreferrer"
                         className="text-blue-600 hover:text-blue-800 underline block"
                       >
-                        {factoryAddress}
+                        {masterCopy}
                       </a>
                     </div>
                   </div>
@@ -1474,13 +1526,13 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Optional Modules (using multicall result) with loading state initially
       updatedResults[8] = {
-        title: 'Optional Modules',
+        title: CHECK_TITLES.OPTIONAL_MODULES,
         status: modules.length === 0 ? 'success' : 'loading',
         message: modules.length === 0
           ? 'No optional modules are enabled. Uses standard Safe functionality only.'
           : `Loading ${modules.length} module${modules.length === 1 ? '' : 's'}...`
       };
-      setResults([...updatedResults]);
+      safeSetResults([...updatedResults]);
 
       // Fetch module names and update modules display
       if (modules.length > 0) {
@@ -1490,10 +1542,10 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
           const name = await getContractName(moduleAddr, selectedChain);
           return { address: moduleAddr, name };
         })).then(moduleDetails => {
-          setResults(currentResults => {
+          safeSetResults(currentResults => {
             const newResults = [...currentResults];
             newResults[8] = {
-              title: 'Optional Modules',
+              title: CHECK_TITLES.OPTIONAL_MODULES,
               status: 'warning',
               message: (
                 <div className="min-w-0">
@@ -1525,10 +1577,10 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
           });
         }).catch(error => {
           console.error('Error fetching module names:', error);
-          setResults(currentResults => {
+          safeSetResults(currentResults => {
             const newResults = [...currentResults];
             newResults[8] = {
-              title: 'Optional Modules',
+              title: CHECK_TITLES.OPTIONAL_MODULES,
               status: 'warning',
               message: `${modules.length} module${modules.length === 1 ? '' : 's'} enabled. Review module security. Could not load module names.`
             };
@@ -1539,14 +1591,14 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Last transaction date when ready
       lastTxDatePromise.then(lastTxDate => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
           // Check nonce first - if it's 0, this Safe has never executed a transaction
           const nonceNum = Number(nonce);
           if (nonceNum === 0) {
             newResults[6] = {
-              title: 'Last Transaction Date',
+              title: CHECK_TITLES.LAST_TRANSACTION_DATE,
               status: 'warning',
               message: 'No transactions found. This Safe has never been used.'
             };
@@ -1554,18 +1606,18 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             const daysSinceLastTx = (Date.now() - lastTxDate.getTime()) / (1000 * 60 * 60 * 24);
             const formattedLastTxDate = lastTxDate.toLocaleDateString();
             newResults[6] = {
-              title: 'Last Transaction Date',
-              status: daysSinceLastTx >= 90 ? 'error' : daysSinceLastTx > 30 ? 'warning' : 'success',
-              message: daysSinceLastTx >= 90
+              title: CHECK_TITLES.LAST_TRANSACTION_DATE,
+              status: daysSinceLastTx >= INACTIVITY_ERROR_DAYS ? 'error' : daysSinceLastTx > INACTIVITY_WARNING_DAYS ? 'warning' : 'success',
+              message: daysSinceLastTx >= INACTIVITY_ERROR_DAYS
                 ? `Inactive for ${Math.floor(daysSinceLastTx)} days. Last transaction: ${formattedLastTxDate}.`
-                : daysSinceLastTx > 30
+                : daysSinceLastTx > INACTIVITY_WARNING_DAYS
                   ? `Last used ${Math.floor(daysSinceLastTx)} days ago on ${formattedLastTxDate}.`
                   : `Recently active. Last transaction: ${formattedLastTxDate} (${Math.floor(daysSinceLastTx)} days ago).`
             };
           } else {
             // API error or other issue - nonce > 0 but couldn't get transaction date
             newResults[6] = {
-              title: 'Last Transaction Date',
+              title: CHECK_TITLES.LAST_TRANSACTION_DATE,
               status: 'unavailable',
               message: 'Could not determine last transaction date'
             };
@@ -1576,27 +1628,27 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Owner Activity Analysis when ready
       ownerActivityPromise.then(({ activeOwners, inactiveOwners, errorOwners }) => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
           if (errorOwners.length === owners.length) {
             // All owners had errors, likely due to missing API key or unsupported chain
-            newResults[12] = {
-              title: 'Owner Activity Analysis',
+            newResults[9] = {
+              title: CHECK_TITLES.OWNER_ACTIVITY,
               status: 'unavailable',
               message: 'Could not analyze owner activity (Explorer API key required)'
             };
           } else if (activeOwners.length === 0) {
             // All owners are inactive (good)
-            newResults[12] = {
-              title: 'Owner Activity Analysis',
+            newResults[9] = {
+              title: CHECK_TITLES.OWNER_ACTIVITY,
               status: 'success',
               message: `All ${inactiveOwners.length} owner${inactiveOwners.length === 1 ? '' : 's'} may be used exclusively for multisig signing (no recent non-multisig transactions).`
             };
           } else {
             // Some owners are active (not ideal)
-            newResults[12] = {
-              title: 'Owner Activity Analysis',
+            newResults[9] = {
+              title: CHECK_TITLES.OWNER_ACTIVITY,
               status: 'warning',
               message: (
                 <div className="min-w-0">
@@ -1632,32 +1684,32 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Transaction Guard when ready
       guardPromise.then(guardResult => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
           if (!guardResult) {
-            newResults[9] = {
-              title: 'Transaction Guard',
+            newResults[12] = {
+              title: CHECK_TITLES.TRANSACTION_GUARD,
               status: 'unavailable',
               message: 'Could not check transaction guard status'
             };
           } else if (typeof guardResult === 'object' && 'error' in guardResult) {
-            newResults[9] = {
-              title: 'Transaction Guard',
+            newResults[12] = {
+              title: CHECK_TITLES.TRANSACTION_GUARD,
               status: 'unavailable',
               message: 'Could not check transaction guard status (Safe version too old for guard support)'
             };
-          } else if (guardResult === '0x0000000000000000000000000000000000000000' || guardResult === '') {
+          } else if (guardResult === ZERO_ADDRESS || guardResult === '') {
             // No guard enabled (good)
-            newResults[9] = {
-              title: 'Transaction Guard',
+            newResults[12] = {
+              title: CHECK_TITLES.TRANSACTION_GUARD,
               status: 'success',
               message: 'No transaction guard enabled. Uses standard Safe transaction execution.'
             };
           } else {
             // Guard enabled (warning - requires review)
-            newResults[9] = {
-              title: 'Transaction Guard',
+            newResults[12] = {
+              title: CHECK_TITLES.TRANSACTION_GUARD,
               status: 'warning',
               message: (
                 <div className="min-w-0">
@@ -1686,19 +1738,19 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Fallback Handler when ready
       fallbackHandlerPromise.then(fallbackHandlerResult => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
           if (!fallbackHandlerResult) {
-            newResults[10] = {
-              title: 'Fallback Handler',
+            newResults[13] = {
+              title: CHECK_TITLES.FALLBACK_HANDLER,
               status: 'unavailable',
               message: 'Could not check fallback handler status'
             };
-          } else if (fallbackHandlerResult === '0x0000000000000000000000000000000000000000' || fallbackHandlerResult === '') {
+          } else if (fallbackHandlerResult === ZERO_ADDRESS || fallbackHandlerResult === '') {
             // No fallback handler enabled (good)
-            newResults[10] = {
-              title: 'Fallback Handler',
+            newResults[13] = {
+              title: CHECK_TITLES.FALLBACK_HANDLER,
               status: 'success',
               message: 'No fallback handler enabled. Uses standard Safe functionality only.'
             };
@@ -1708,8 +1760,8 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
             if (handlerName) {
               // Known official fallback handler (good)
-              newResults[10] = {
-                title: 'Fallback Handler',
+              newResults[13] = {
+                title: CHECK_TITLES.FALLBACK_HANDLER,
                 status: 'success',
                 message: (
                   <div className="min-w-0">
@@ -1732,8 +1784,8 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
               };
             } else {
               // Unknown fallback handler (warning - requires review)
-              newResults[10] = {
-                title: 'Fallback Handler',
+              newResults[13] = {
+                title: CHECK_TITLES.FALLBACK_HANDLER,
                 status: 'warning',
                 message: (
                   <div className="min-w-0">
@@ -1763,39 +1815,39 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Chain Configuration when ready
       chainConfigPromise.then(({ deployedChains, totalDeployments }) => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
           if (totalDeployments === 0) {
             // Should not happen as we already verified the contract exists
-            newResults[11] = {
-              title: 'Chain Configuration',
+            newResults[14] = {
+              title: CHECK_TITLES.CHAIN_CONFIGURATION,
               status: 'unavailable',
               message: 'Could not verify Safe deployment on any chain'
             };
           } else if (totalDeployments === 1) {
             // Safe only deployed on one chain (good)
-            newResults[11] = {
-              title: 'Chain Configuration',
+            newResults[14] = {
+              title: CHECK_TITLES.CHAIN_CONFIGURATION,
               status: 'success',
               message: `Safe is deployed only on ${selectedChain.name}. No multi-chain deployment detected.`
             };
 
             // Skip Multi-Chain Signer Analysis for single-chain deployments
-            newResults[15] = {
-              title: 'Multi-Chain Signer Analysis',
+            newResults[11] = {
+              title: CHECK_TITLES.MULTI_CHAIN_SIGNER,
               status: 'success',
               message: 'Not applicable - Safe is only deployed on one chain.'
             };
           } else {
-            // Safe deployed on multiple chains (warning - replay risk)
+            // Safe deployed on multiple chains (informational)
             const chainNames = deployedChains.map(chain => chain.name).join(', ');
-            newResults[11] = {
-              title: 'Chain Configuration',
-              status: 'warning',
+            newResults[14] = {
+              title: CHECK_TITLES.CHAIN_CONFIGURATION,
+              status: 'success',
               message: (
                 <div>
-                  <div>⚠️ Multi-chain deployment detected. Not an issue on its own, but this Safe exists on {totalDeployments} chains with the same address.</div>
+                  <div>Multi-chain deployment detected. This Safe exists on {totalDeployments} chains with the same address.</div>
                   <div className="mt-1 sm:mt-2">
                     <div className="font-medium text-sm sm:text-base">Deployed on:</div>
                     <div className="ml-1 sm:ml-2 text-sm sm:text-base">{chainNames}</div>
@@ -1805,28 +1857,28 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             };
 
             // Trigger multi-chain signer reuse analysis
-            newResults[15] = {
-              title: 'Multi-Chain Signer Analysis',
+            newResults[11] = {
+              title: CHECK_TITLES.MULTI_CHAIN_SIGNER,
               status: 'loading',
               message: 'Analyzing signer reuse across chains...'
             };
 
             // Perform multi-chain signer analysis
             checkMultiChainSignerReuse(addressToAnalyze, deployedChains).then(({ reusedSigners, signerChains }) => {
-              setResults(currentResults => {
+              safeSetResults(currentResults => {
                 const updatedResults = [...currentResults];
 
                 if (reusedSigners.length === 0) {
                   // No signer reuse detected (good)
-                  updatedResults[15] = {
-                    title: 'Multi-Chain Signer Analysis',
+                  updatedResults[11] = {
+                    title: CHECK_TITLES.MULTI_CHAIN_SIGNER,
                     status: 'success',
                     message: '✅ No signer address appears on different chains. Each chain has unique signers.'
                   };
                 } else {
                   // Signer reuse detected (warning)
-                  updatedResults[15] = {
-                    title: 'Multi-Chain Signer Analysis',
+                  updatedResults[11] = {
+                    title: CHECK_TITLES.MULTI_CHAIN_SIGNER,
                     status: 'warning',
                     message: (
                       <div className="min-w-0">
@@ -1858,10 +1910,10 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
               });
             }).catch(error => {
               console.error('Multi-chain signer analysis failed:', error);
-              setResults(currentResults => {
+              safeSetResults(currentResults => {
                 const updatedResults = [...currentResults];
-                updatedResults[15] = {
-                  title: 'Multi-Chain Signer Analysis',
+                updatedResults[11] = {
+                  title: CHECK_TITLES.MULTI_CHAIN_SIGNER,
                   status: 'unavailable',
                   message: 'Could not analyze signer reuse across chains'
                 };
@@ -1874,10 +1926,10 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
         });
       }).catch(error => {
         console.error('Error checking chain configuration:', error);
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
-          newResults[11] = {
-            title: 'Chain Configuration',
+          newResults[14] = {
+            title: CHECK_TITLES.CHAIN_CONFIGURATION,
             status: 'unavailable',
             message: 'Could not complete multi-chain deployment check'
           };
@@ -1889,14 +1941,14 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       // duration, and the threshold check already penalizes this configuration)
       if (thresholdNum > 1) {
         fetchAndAnalyzeSafe(addressToAnalyze, selectedChain.id).then(speedAnalysis => {
-          setResults(currentResults => {
+          safeSetResults(currentResults => {
             const newResults = [...currentResults];
 
-            const status = speedAnalysis.average_duration_seconds < 600 ? 'error' :
-                          speedAnalysis.average_duration_seconds < 21600 ? 'warning' : 'success';
+            const status = speedAnalysis.average_duration_seconds < SIGNING_SPEED_ERROR_SECONDS ? 'error' :
+                          speedAnalysis.average_duration_seconds < SIGNING_SPEED_WARNING_SECONDS ? 'warning' : 'success';
 
             newResults[0] = {
-              title: 'Signing Speed Analysis',
+              title: CHECK_TITLES.SIGNING_SPEED,
               status,
               message: (
                 <SpeedTest
@@ -1912,21 +1964,24 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             return newResults;
           });
         }).catch(() => {
-          setResults(currentResults => {
+          safeSetResults(currentResults => {
             const newResults = [...currentResults];
-            newResults[0] = {
-              title: 'Signing Speed Analysis',
-              status: 'unavailable',
-              message: 'No transaction data available for signing speed analysis'
-            };
+            // Only set unavailable if the API hasn't already returned a real result
+            if (newResults[0].status === 'loading') {
+              newResults[0] = {
+                title: CHECK_TITLES.SIGNING_SPEED,
+                status: 'unavailable',
+                message: 'No transaction data available for signing speed analysis'
+              };
+            }
             return newResults;
           });
         });
       } else {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
           newResults[0] = {
-            title: 'Signing Speed Analysis',
+            title: CHECK_TITLES.SIGNING_SPEED,
             status: 'success',
             message: 'Signing speed analysis skipped for single-signer Safe (threshold is 1).'
           };
@@ -1936,13 +1991,13 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
 
       // Update Emergency Recovery Mechanisms when ready
       recoveryPromise.then(({ hasRecoveryModule, recoveryModules, recoveryThreshold, normalThreshold, thresholdComparison }) => {
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
           if (!hasRecoveryModule) {
             // No recovery module (neutral - not necessarily bad)
-            newResults[13] = {
-              title: 'Emergency Recovery Mechanisms',
+            newResults[15] = {
+              title: CHECK_TITLES.EMERGENCY_RECOVERY,
               status: 'warning',
               message: 'No recovery module detected. Consider implementing social recovery or guardian mechanisms for emergency access.'
             };
@@ -1950,8 +2005,8 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             // Recovery module exists - assess configuration
             if (thresholdComparison === 'lower') {
               // Recovery threshold is lower than normal - potential security risk
-              newResults[13] = {
-                title: 'Emergency Recovery Mechanisms',
+              newResults[15] = {
+                title: CHECK_TITLES.EMERGENCY_RECOVERY,
                 status: 'error',
                 message: (
                   <div className="min-w-0">
@@ -1989,8 +2044,8 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
               };
             } else if (thresholdComparison === 'equal') {
               // Recovery threshold equals normal - reasonable
-              newResults[13] = {
-                title: 'Emergency Recovery Mechanisms',
+              newResults[15] = {
+                title: CHECK_TITLES.EMERGENCY_RECOVERY,
                 status: 'success',
                 message: (
                   <div className="min-w-0">
@@ -2019,8 +2074,8 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
               };
             } else if (thresholdComparison === 'higher') {
               // Recovery threshold is higher - very secure
-              newResults[13] = {
-                title: 'Emergency Recovery Mechanisms',
+              newResults[15] = {
+                title: CHECK_TITLES.EMERGENCY_RECOVERY,
                 status: 'success',
                 message: (
                   <div className="min-w-0">
@@ -2050,8 +2105,8 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
               };
             } else {
               // Unknown threshold comparison
-              newResults[13] = {
-                title: 'Emergency Recovery Mechanisms',
+              newResults[15] = {
+                title: CHECK_TITLES.EMERGENCY_RECOVERY,
                 status: 'warning',
                 message: (
                   <div className="min-w-0">
@@ -2089,10 +2144,10 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
         });
       }).catch(error => {
         console.error('Error checking recovery mechanisms:', error);
-        setResults(currentResults => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
-          newResults[13] = {
-            title: 'Emergency Recovery Mechanisms',
+          newResults[15] = {
+            title: CHECK_TITLES.EMERGENCY_RECOVERY,
             status: 'unavailable',
             message: 'Could not check recovery mechanisms'
           };
@@ -2101,27 +2156,38 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
       });
 
       // Update Contract Signers when ready
-      contractSignersPromise.then(contractSigners => {
-        setResults(currentResults => {
+      contractSignersPromise.then(({ contractSigners, eip7702Signers }) => {
+        safeSetResults(currentResults => {
           const newResults = [...currentResults];
 
-          if (contractSigners.length === 0) {
-            // All signers are EOAs (good)
-            newResults[14] = {
-              title: 'Contract Signers',
+          if (contractSigners.length === 0 && eip7702Signers.length === 0) {
+            newResults[10] = {
+              title: CHECK_TITLES.CONTRACT_SIGNERS,
               status: 'success',
               message: 'No multisig signers are contracts. All signers are externally owned accounts (EOAs).'
             };
+          } else if (contractSigners.length === 0 && eip7702Signers.length > 0) {
+            const eip7702List = eip7702Signers.length > 3
+              ? eip7702Signers.slice(0, 3).join(', ') + ` and ${eip7702Signers.length - 3} more`
+              : eip7702Signers.join(', ');
+            newResults[10] = {
+              title: CHECK_TITLES.CONTRACT_SIGNERS,
+              status: 'success',
+              message: `No signers are contracts, but ${eip7702Signers.length} signer${eip7702Signers.length === 1 ? ' has' : 's have'} an active EIP-7702 delegation (EOA with temporary contract code). These remain EOAs controlled by their private keys. Delegated: ${eip7702List}`
+            };
           } else {
-            // Some signers are contracts (warning)
             const contractList = contractSigners.length > 3
               ? contractSigners.slice(0, 3).join(', ') + ` and ${contractSigners.length - 3} more`
               : contractSigners.join(', ');
 
-            newResults[14] = {
-              title: 'Contract Signers',
+            const eip7702Note = eip7702Signers.length > 0
+              ? ` Additionally, ${eip7702Signers.length} signer${eip7702Signers.length === 1 ? ' has' : 's have'} an EIP-7702 delegation (EOA with temporary contract code).`
+              : '';
+
+            newResults[10] = {
+              title: CHECK_TITLES.CONTRACT_SIGNERS,
               status: 'warning',
-              message: `${contractSigners.length} signer${contractSigners.length === 1 ? '' : 's'} ${contractSigners.length === 1 ? 'is a contract' : 'are contracts'}, not EOA${contractSigners.length === 1 ? '' : 's'}. Need to recursively check those signers. Contract signers: ${contractList}`
+              message: `${contractSigners.length} signer${contractSigners.length === 1 ? 'is a contract' : 's are contracts'}, not EOA${contractSigners.length === 1 ? '' : 's'}. Need to recursively check those signers. Contract signers: ${contractList}${eip7702Note}`
             };
           }
 
@@ -2218,21 +2284,36 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
     });
   };
 
+  const toastTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const toastFadeTimeoutRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const showToast = () => {
+    // Clear any pending timeouts from a previous toast to prevent race conditions
+    if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+    if (toastFadeTimeoutRef.current) clearTimeout(toastFadeTimeoutRef.current);
+
     setShowShareToast(true);
     setIsToastFading(false);
 
     // Start fade out after 1 second
-    setTimeout(() => {
+    toastFadeTimeoutRef.current = setTimeout(() => {
       setIsToastFading(true);
     }, 1000);
 
     // Completely hide after fade completes
-    setTimeout(() => {
+    toastTimeoutRef.current = setTimeout(() => {
       setShowShareToast(false);
       setIsToastFading(false);
     }, 1500);
   };
+
+  // Clean up toast timeouts on unmount to prevent memory leaks
+  React.useEffect(() => {
+    return () => {
+      if (toastTimeoutRef.current) clearTimeout(toastTimeoutRef.current);
+      if (toastFadeTimeoutRef.current) clearTimeout(toastFadeTimeoutRef.current);
+    };
+  }, []);
 
 
 
@@ -2444,18 +2525,23 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
                   <h2 className="text-lg font-semibold text-[var(--color-text-primary)]">
                     Security Analysis Results
                   </h2>
-                  {results.some(r => r.status === 'loading') && (
-                    <div className="flex items-center gap-2 text-sm text-[var(--color-text-tertiary)]">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      <span>Analyzing...</span>
-                    </div>
-                  )}
-                  {!results.some(r => r.status === 'loading') && (securityScore.unavailableChecks > 0) && (
-                    <div className="flex items-center gap-2 text-sm text-[var(--color-text-tertiary)]">
-                      <HelpCircle className="h-4 w-4" />
-                      <span>Incomplete</span>
-                    </div>
-                  )}
+                  <div className="flex items-center gap-3">
+                    <span className="text-xs font-medium text-[var(--color-text-tertiary)] bg-[var(--color-surface)] border border-[var(--color-border)] rounded-full px-2.5 py-0.5">
+                      {APP_VERSION}
+                    </span>
+                    {results.some(r => r.status === 'loading') && (
+                      <div className="flex items-center gap-2 text-sm text-[var(--color-text-tertiary)]">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <span>Analyzing...</span>
+                      </div>
+                    )}
+                    {!results.some(r => r.status === 'loading') && (securityScore.unavailableChecks > 0) && (
+                      <div className="flex items-center gap-2 text-sm text-[var(--color-text-tertiary)]">
+                        <HelpCircle className="h-4 w-4" />
+                        <span>Incomplete</span>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
               
@@ -2538,11 +2624,6 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
                             <div key={idx} className="flex items-center justify-between text-sm">
                               <div className="flex items-center gap-2">
                                 <span className="text-[var(--color-text-secondary)]">{penalty.title}</span>
-                                {penalty.isCritical && (
-                                  <span className="rounded bg-[var(--color-error)]/10 px-1.5 py-0.5 text-xs font-medium text-[var(--color-error)]">
-                                    Critical
-                                  </span>
-                                )}
                               </div>
                               <span className="font-medium text-[var(--color-error)]">-{penalty.points}</span>
                             </div>
@@ -2562,21 +2643,33 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
                           
                           {/* Legend */}
                           <div className="mt-3 rounded-lg bg-[var(--color-surface-secondary)] p-3 text-xs text-[var(--color-text-secondary)]">
-                            <p className="mb-1 font-medium text-[var(--color-text-primary)]">How scoring works:</p>
-                            <ul className="space-y-1">
-                              <li className="flex items-center gap-1.5">
-                                <ShieldAlert className="h-3 w-3 text-[var(--color-error)]" />
-                                <span><strong>Critical checks</strong> (Signer Threshold, Threshold Percentage): Errors cost 18-20 points</span>
-                              </li>
-                              <li className="flex items-center gap-1.5">
-                                <Shield className="h-3 w-3 text-[var(--color-warning)]" />
-                                <span><strong>Standard checks</strong>: Errors cost 8-15 points</span>
-                              </li>
-                              <li className="flex items-center gap-1.5">
-                                <span className="rounded-full bg-[var(--color-error)]/10 px-1.5 py-0 text-[10px] font-medium text-[var(--color-error)]">x2</span>
-                                <span>Multiple critical issues incur additional penalties</span>
-                              </li>
-                            </ul>
+                            <details>
+                              <summary className="cursor-pointer font-medium text-[var(--color-text-primary)] select-none">
+                                How scoring works
+                                <ChevronDown className="ml-1 inline h-3 w-3 transition-transform group-open:rotate-180" />
+                              </summary>
+                              <p className="mt-1 mb-2">Check penalties range from 1-20 points depending on severity.</p>
+                              <table className="w-full border-collapse text-xs">
+                                <thead>
+                                  <tr className="border-b border-[var(--color-border)]">
+                                    <th className="py-1 pr-2 text-left font-medium text-[var(--color-text-primary)]">Check</th>
+                                    <th className="py-1 px-2 text-right font-medium text-[var(--color-warning)]">Warning</th>
+                                    <th className="py-1 pl-2 text-right font-medium text-[var(--color-error)]">Error</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {Object.entries(PENALTY_CONFIG)
+                                    .sort(([, a], [, b]) => b.error - a.error)
+                                    .map(([title, config]) => (
+                                      <tr key={title} className="border-b border-[var(--color-border)]/50 last:border-0">
+                                        <td className="py-1 pr-2">{title}</td>
+                                        <td className="py-1 px-2 text-right">-{config.warning}</td>
+                                        <td className="py-1 pl-2 text-right">-{config.error}</td>
+                                      </tr>
+                                    ))}
+                                </tbody>
+                              </table>
+                            </details>
                           </div>
                         </div>
                       </details>
@@ -2587,10 +2680,10 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
             </div>
           )}
 
-          {/* Results List */}
+          {/* Scored Checks */}
           <div className="space-y-3">
             {results
-            .filter(result => result && result.status && result.title)
+            .filter(result => result && result.status && result.title && !INFORMATIONAL_CHECKS.has(result.title))
             .map((result, index) => {
 
               // Special rendering for Signing Speed Analysis - it renders its own container
@@ -2684,7 +2777,6 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
                     {result.status !== 'success' && result.status !== 'loading' && result.status !== 'unavailable' && (
                       <div className="mt-1.5 text-xs text-[var(--color-text-tertiary)]">
                         Score impact: -{result.status === 'error' ? penaltyConfig.error : penaltyConfig.warning} points
-                        {penaltyConfig.isCritical && ' (Critical)'}
                       </div>
                     )}
                     
@@ -2733,6 +2825,105 @@ export default function MultisigChecker({ initialChainId, initialAddress, autoAn
               </div>
             );
           })}
+
+          {/* Informational Checks */}
+          {results.some(r => r && r.title && INFORMATIONAL_CHECKS.has(r.title) && r.status && r.status !== 'loading') && (
+            <div className="mt-6 pt-6 border-t border-[var(--color-border)]">
+              <h3 className="text-sm font-semibold text-[var(--color-text-tertiary)] uppercase tracking-wider mb-3">Informational</h3>
+              <div className="space-y-3">
+                {results
+                  .filter(result => result && result.status && result.title && INFORMATIONAL_CHECKS.has(result.title))
+                  .map((result, index) => {
+
+              const tooltipInfo = getTooltipInfo(result.title);
+              const isTooltipOpen = openTooltip === `info-${index}`;
+
+              return (
+                <div
+                  key={`info-${index}`}
+                  className={cn(
+                    "rounded-lg border p-4 relative",
+                    result.status === 'success' && "bg-[var(--color-surface-secondary)] border-[var(--color-border)]",
+                    result.status === 'warning' && "bg-[var(--color-warning-bg)] border-[var(--color-warning)]/30",
+                    result.status === 'error' && "bg-[var(--color-error-bg)] border-[var(--color-error)]/30",
+                    result.status === 'unavailable' && "bg-[var(--color-surface-secondary)] border-[var(--color-border)]"
+                  )}
+                >
+                  <div className="flex items-start gap-4">
+                    <div className="flex items-center justify-center w-6 h-6 shrink-0">
+                      {result.status === 'success' && <CheckCircle className="h-5 w-5 text-[var(--color-text-tertiary)]" />}
+                      {result.status === 'warning' && <AlertTriangle className="h-5 w-5 text-[var(--color-warning)]" />}
+                      {result.status === 'error' && <XCircle className="h-5 w-5 text-[var(--color-error)]" />}
+                      {result.status === 'unavailable' && <HelpCircle className="h-5 w-5 text-[var(--color-text-tertiary)]" />}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className={cn(
+                          "font-semibold",
+                          result.status === 'success' && "text-[var(--color-text-secondary)]",
+                          result.status === 'warning' && "text-[var(--color-warning)]",
+                          result.status === 'error' && "text-[var(--color-error)]",
+                          result.status === 'unavailable' && "text-[var(--color-text-tertiary)]"
+                        )}>{result.title}</h3>
+                        <span className="text-xs text-[var(--color-text-tertiary)] bg-[var(--color-surface-secondary)] px-1.5 py-0.5 rounded">Informational</span>
+                        
+                        <button
+                          onClick={() => setOpenTooltip(isTooltipOpen ? null : `info-${index}`)}
+                          className="focus:outline-none focus:ring-2 focus:ring-[var(--color-primary)]/20 rounded-full p-1 transition-colors text-[var(--color-text-tertiary)]/70 hover:text-[var(--color-text-tertiary)]"
+                          aria-label="Show information"
+                        >
+                          <Info className="h-4 w-4" />
+                        </button>
+                      </div>
+                      
+                      <div className="mt-1 text-sm text-[var(--color-text-primary)]">{result.message}</div>
+
+                      {isTooltipOpen && (
+                        <div className="mt-4 rounded-lg border border-[var(--color-border)] bg-[var(--color-surface-secondary)] p-4">
+                          <div className="space-y-3">
+                            <div>
+                              <h4 className="font-semibold text-[var(--color-text-primary)] mb-1">About this check:</h4>
+                              <p className="text-sm text-[var(--color-text-secondary)]">{tooltipInfo.description}</p>
+                            </div>
+
+                            {tooltipInfo.thresholds.length > 0 && (
+                              <div>
+                                <h4 className="font-semibold text-[var(--color-text-primary)] mb-2">Status Thresholds:</h4>
+                                <div className="space-y-1">
+                                  {tooltipInfo.thresholds.map((threshold, idx) => (
+                                    <div key={idx} className="text-sm text-[var(--color-text-secondary)]">
+                                      <span className="font-medium">{threshold.status}:</span>
+                                      <span className="ml-1">{threshold.condition}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            <div className="pt-2 border-t border-[var(--color-border)]">
+                              <a
+                                href={tooltipInfo.learnMoreUrl}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-sm text-[var(--color-primary)] hover:underline font-medium inline-flex items-center gap-1"
+                              >
+                                Learn more
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                                </svg>
+                              </a>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+              </div>
+            </div>
+          )}
         </div>
         </div>
       )}
